@@ -55,7 +55,6 @@ def parse_args():
     p.add_argument('--device', type=str, default=None,
                    help='Match only devices whose name contains this string (case-insensitive)')
     args = p.parse_args()
-    global _verbose
     _verbose = args.verbose
     return args
 
@@ -193,9 +192,7 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    fd_to_dev = {}
-    for name, dev in dev_list:
-        fd_to_dev[dev.fd] = (name, dev)
+    fd_to_dev = {dev.fd: (name, dev) for name, dev in dev_list}
 
     # ── state ──
     state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
