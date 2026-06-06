@@ -40,6 +40,8 @@ def parse_args():
                    help='Disable horizontal scroll')
     p.add_argument('--invert', action='store_true',
                    help='Invert scroll direction')
+    p.add_argument('--single-click', action='store_true',
+                   help='Single click-and-hold to scroll (no double-click needed)')
     return p.parse_args()
 
 
@@ -198,7 +200,21 @@ def main():
                         now = time.monotonic()
 
                         if state.mode == IDLE:
-                            state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
+                            if args.single_click:
+                                # Single-click mode: press → scroll immediately
+                                state = ScrollState(mode=SCROLL_MODE,
+                                                    first_time=now,
+                                                    trigger_dev=fd)
+                                pos = last_pos.get(fd)
+                                if pos is not None:
+                                    anchor = pos
+                                else:
+                                    acc = rel_accum.get(fd, [0, 0])
+                                    anchor = (acc[0], acc[1])
+                                rel_accum.pop(fd, None)
+                                print(f"[INFO] Scroll mode ON ({name})")
+                            else:
+                                state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
 
                         elif state.mode == FIRST_CLICK:
                             if now - state.first_time <= timeout_s:
