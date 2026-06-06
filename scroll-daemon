@@ -34,8 +34,8 @@ def parse_args():
                    help='Scroll speed (default: 0.00024, higher = faster)')
     p.add_argument('--timeout', type=int, default=300,
                    help='Double-click timeout in ms (default: 300)')
-    p.add_argument('--deadzone', type=int, default=8,
-                   help='Radius in pixels where no scroll occurs (default: 8)')
+    p.add_argument('--deadzone', type=int, default=16,
+                   help='Radius in pixels where no scroll occurs (default: 16)')
     p.add_argument('--no-horizontal', action='store_true',
                    help='Disable horizontal scroll')
     p.add_argument('--invert', action='store_true',
@@ -154,7 +154,8 @@ def main():
     scroll_hi_x = 0.0          # fractional hi-res scroll accumulators (120 → 1 notch)
     scroll_hi_y = 0.0          # finer quantization for smooth low-speed scrolling
 
-    print("[INFO] Listening. Double middle-click + hold to scroll. Ctrl+C to stop.")
+    mode_label = "Double" if args.double_click else "Single"
+    print(f"[INFO] Listening. {mode_label} middle-click + hold to scroll. Ctrl+C to stop.")
 
     while not _shutdown:
         fds = [dev.fd for _, dev in dev_list]
