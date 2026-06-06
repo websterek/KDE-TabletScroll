@@ -2,7 +2,7 @@
 """
 Middle-click scroll daemon for Linux (X11 + Wayland).
 
-Double middle-click-and-hold → Windows-style autoscroll:
+  Middle-click-and-hold → Windows-style autoscroll:
   Pen/mouse distance from click point determines scroll speed and direction.
   Farther from anchor = faster. Direction = scroll direction.
   Release middle button → back to normal.
@@ -40,8 +40,8 @@ def parse_args():
                    help='Disable horizontal scroll')
     p.add_argument('--invert', action='store_true',
                    help='Invert scroll direction')
-    p.add_argument('--single-click', action='store_true',
-                   help='Single click-and-hold to scroll (no double-click needed)')
+    p.add_argument('--double-click', action='store_true',
+                   help='Require double-click-and-hold to scroll (default: single click)')
     return p.parse_args()
 
 
@@ -200,8 +200,8 @@ def main():
                         now = time.monotonic()
 
                         if state.mode == IDLE:
-                            if args.single_click:
-                                # Single-click mode: press → scroll immediately
+                            if not args.double_click:
+                                # Default single-click: press → scroll immediately
                                 state = ScrollState(mode=SCROLL_MODE,
                                                     first_time=now,
                                                     trigger_dev=fd)
