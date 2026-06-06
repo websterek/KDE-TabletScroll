@@ -27,7 +27,7 @@ from evdev import InputDevice, UInput, ecodes, list_devices
 
 # ── CLI ────────────────────────────────────────────────────────────
 
-_verbose = False  # set by parse_args() when --verbose is passed
+_verbose = False  # set by main() when --verbose is passed
 
 def _dbg(msg):
     """Print a debug message only when --verbose is set."""
@@ -35,7 +35,6 @@ def _dbg(msg):
         print(f"[INFO] {msg}")
 
 def parse_args():
-    global _verbose
     p = argparse.ArgumentParser(description='Middle-click scroll daemon')
     p.add_argument('--sensitivity', type=float, default=0.00024,
                    help='Scroll speed (default: 0.00024, higher = faster)')
@@ -49,9 +48,7 @@ def parse_args():
                    help='Print status messages (device opened, scroll mode, etc.)')
     p.add_argument('--device', type=str, default=None,
                    help='Match only devices whose name contains this string (case-insensitive)')
-    args = p.parse_args()
-    _verbose = args.verbose
-    return args
+    return p.parse_args()
 
 
 # ── device discovery ───────────────────────────────────────────────
@@ -124,6 +121,10 @@ SCROLL_MODE = 1
 # Scroll tick interval: ~60 fps for smooth continuous scrolling
 SCROLL_TICK = 0.016
 
+# Duration (seconds) the anchor floats with cursor movement after entering
+# scroll mode, absorbing click-pressure wobble before locking.
+SETTLE_DURATION = 0.1
+
 
 def _get_device_position(fd, last_pos, rel_accum):
     """Return (x, y) for a device from absolute tracking or relative accumulation."""
@@ -154,8 +155,21 @@ def emit_scroll(ui, dx_hi_res, dy_hi_res, no_horizontal):
         ui.syn()
 
 
+def _enter_scroll_mode(fd, last_pos, rel_accum):
+    """Set up scroll mode state: track given fd, seed anchor, arm settle window."""
+    anchor = _get_device_position(fd, last_pos, rel_accum)
+    return (SCROLL_MODE, fd, anchor, time.monotonic() + SETTLE_DURATION, [])
+
+def _exit_scroll_mode():
+    """Return idle state for scroll-mode fields (anchor is left unchanged)."""
+    return (IDLE, None, 0.0, [])
+
+# ── main ────────────────────────────────────────────────────────────
+
 def main():
+    global _verbose
     args = parse_args()
+    _verbose = args.verbose
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
@@ -229,27 +243,18 @@ def main():
                 if etype == ecodes.EV_KEY and ecode == ecodes.BTN_MIDDLE:
                     if evalue == 1:  # PRESS
                         if mode == IDLE:
-                            mode = SCROLL_MODE
-                            trigger_dev = fd
-                            # Seed anchor from last known position so the
-                            # settling window has a sane starting point.
-                            anchor = _get_device_position(fd, last_pos, rel_accum)
-                            anchor_settle_deadline = time.monotonic() + 0.1
-                            anchor_settle_samples.clear()
+                            mode, trigger_dev, anchor, anchor_settle_deadline, anchor_settle_samples = \
+                                _enter_scroll_mode(fd, last_pos, rel_accum)
                             _dbg(f"Scroll mode ON ({name})")
                         elif mode == SCROLL_MODE:
-                            mode = IDLE
-                            trigger_dev = None
-                            anchor_settle_deadline = 0.0
-                            anchor_settle_samples.clear()
+                            mode, trigger_dev, anchor_settle_deadline, anchor_settle_samples = \
+                                _exit_scroll_mode()
                             _dbg("Scroll mode OFF")
 
                     elif evalue == 0:  # RELEASE
                         if mode == SCROLL_MODE:
-                            mode = IDLE
-                            trigger_dev = None
-                            anchor_settle_deadline = 0.0
-                            anchor_settle_samples.clear()
+                            mode, trigger_dev, anchor_settle_deadline, anchor_settle_samples = \
+                                _exit_scroll_mode()
                             _dbg("Scroll mode OFF (released)")
 
         # ── scroll tick: emit scroll based on offset from anchor ──
