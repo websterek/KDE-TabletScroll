@@ -10,6 +10,13 @@ Middle-click scroll daemon for Linux (X11 + Wayland).
 Usage:
   scroll-daemon [--sensitivity FLOAT] [--deadzone PX]
                 [--no-horizontal] [--invert] [--device NAME]
+                [--config TOML]
+
+Config file (~/.config/tabletscroll/config.toml):
+  sensitivity = 0.03
+  deadzone = 16
+  scroll_events = "both"
+  # CLI flags override config values.
 
 Requirements:
   python-evdev (pacman -S python-evdev or pip install evdev)
@@ -18,10 +25,20 @@ Requirements:
 
 import argparse
 import math
+import os
 import signal
 import sys
 import time
+from pathlib import Path
 from select import select
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # Python <3.11 fallback
+    except ImportError:
+        tomllib = None
 
 from evdev import InputDevice, UInput, ecodes, list_devices
 
@@ -35,22 +52,91 @@ def _dbg(msg):
         print(f"[INFO] {msg}")
 
 def parse_args():
+    """Parse CLI arguments with config file support.
+
+    Loads TOML config first (default path or --config override), then uses
+    config values as argparse defaults. CLI flags override config values.
+    Hardcoded defaults are the fallback when no config file exists.
+
+    Returns:
+        Namespace with fields: sensitivity, deadzone, no_horizontal, invert,
+        verbose, device, scroll_events, config.
+    """
     p = argparse.ArgumentParser(description='Middle-click scroll daemon')
-    p.add_argument('--sensitivity', type=float, default=0.03,
+    p.add_argument('--config', type=str, default=None,
+                   help='Path to TOML config file (default: ~/.config/tabletscroll/config.toml)')
+
+    # Parse --config first to know which file to load, then use config
+    # values as defaults for the remaining arguments.
+    args, _ = p.parse_known_args()
+    config_overrides = load_config(args.config)
+
+    p.add_argument('--sensitivity', type=float,
+                   default=config_overrides.get('sensitivity', 0.03),
                    help='Scroll speed in notches/s per pixel from anchor (default: 0.03)')
-    p.add_argument('--deadzone', type=int, default=16,
+    p.add_argument('--deadzone', type=int,
+                   default=config_overrides.get('deadzone', 16),
                    help='Radius in pixels where no scroll occurs (default: 16)')
     p.add_argument('--no-horizontal', '--vertical-only', action='store_true',
+                   default=config_overrides.get('no_horizontal', False),
                    help='Disable horizontal scroll')
     p.add_argument('--invert', action='store_true',
+                   default=config_overrides.get('invert', False),
                    help='Invert scroll direction')
     p.add_argument('--verbose', action='store_true',
+                   default=config_overrides.get('verbose', False),
                    help='Print status messages (device opened, scroll mode, etc.)')
-    p.add_argument('--device', type=str, default=None,
+    p.add_argument('--device', type=str,
+                   default=config_overrides.get('device', None),
                    help='Match only devices whose name contains this string (case-insensitive)')
-    p.add_argument('--scroll-events', choices=['hi-res', 'both'], default='both',
+    p.add_argument('--scroll-events', choices=['hi-res', 'both'],
+                   default=config_overrides.get('scroll_events', 'both'),
                    help='Scroll event type: hi-res only or hi-res + standard (default: both)')
+
     return p.parse_args()
+
+
+# ── config file ─────────────────────────────────────────────────────
+
+CONFIG_DIR = Path.home() / '.config' / 'tabletscroll'
+DEFAULT_CONFIG = CONFIG_DIR / 'config.toml'
+
+# Map TOML keys to argparse dest names. Only these keys are read;
+# unknown keys are silently ignored.
+_CONFIG_KEYS = {
+    'sensitivity', 'deadzone', 'no_horizontal', 'invert',
+    'verbose', 'device', 'scroll_events',
+}
+
+
+def load_config(path=None):
+    """Load TOML config file, returning a dict of overrides.
+
+    Args:
+        path: Path to config file. Falls back to DEFAULT_CONFIG if None.
+
+    Returns:
+        Dict mapping argparse dest names to values. Empty if no config
+        found, TOML not available, or file is unreadable.
+
+    Raises:
+        SystemExit: If the config file exists but contains invalid TOML.
+    """
+    if tomllib is None:
+        return {}
+
+    filepath = Path(path) if path else DEFAULT_CONFIG
+    if not filepath.is_file():
+        return {}
+
+    try:
+        with open(filepath, 'rb') as f:
+            raw = tomllib.load(f)
+    except Exception as e:
+        print(f"[ERROR] Failed to parse config file '{filepath}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+    return {k: v for k, v in raw.items() if k in _CONFIG_KEYS}
 
 
 # ── device discovery ───────────────────────────────────────────────
@@ -98,7 +184,6 @@ def create_uinput():
             ecodes.REL_WHEEL, ecodes.REL_HWHEEL,
             ecodes.REL_WHEEL_HI_RES, ecodes.REL_HWHEEL_HI_RES,
         ],
-        ecodes.EV_KEY: [ecodes.BTN_MIDDLE],
     }
     ui = UInput(caps, name=OUR_NAME)
     _dbg("uinput device created")
@@ -157,11 +242,62 @@ def emit_scroll(ui, dx_hi_res, dy_hi_res, no_horizontal):
         ui.syn()
 
 
+def compute_scroll_deltas(anchor, cursor, deadzone, sensitivity, invert, dt):
+    """Compute raw scroll deltas from cursor offset from anchor.
+
+    Pure function — no state, no side effects. The caller handles
+    accumulation and emission.
+
+    Args:
+        anchor: (x, y) anchor point.
+        cursor: (x, y) current cursor position.
+        deadzone: radius in pixels where no scroll is produced.
+        sensitivity: scroll speed in notches/s per pixel from anchor.
+        invert: if True, reverse scroll direction.
+        dt: time delta since last tick in seconds.
+
+    Returns:
+        (delta_hi_x, delta_hi_y, delta_std_x, delta_std_y) as floats
+        representing the amount to add to respective accumulators.
+        Returns None if cursor is within the deadzone.
+    """
+    dx = cursor[0] - anchor[0]
+    dy = cursor[1] - anchor[1]
+    dist = math.hypot(dx, dy)
+    if dist <= deadzone:
+        return None
+
+    effective_dist = dist - deadzone
+    rate = effective_dist * sensitivity  # notches/s
+
+    # Direction (normalized) — vertical inverted for Windows-style:
+    # moving cursor down → scroll down (positive REL_WHEEL)
+    nx = dx / dist
+    ny = -dy / dist
+
+    if invert:
+        nx = -nx
+        ny = -ny
+
+    delta_hi_x = nx * rate * dt * 120
+    delta_hi_y = ny * rate * dt * 120
+    delta_std_x = nx * rate * dt
+    delta_std_y = ny * rate * dt
+
+    return (delta_hi_x, delta_hi_y, delta_std_x, delta_std_y)
+
+
 
 
 # ── main ────────────────────────────────────────────────────────────
 
 def main():
+    """Run the middle-click scroll daemon.
+
+    Discovers input devices, creates a uinput scroll device, and enters the
+    event loop. Middle-click-and-hold enters scroll mode; release exits.
+    Ctrl+C or SIGTERM triggers graceful shutdown.
+    """
     global _verbose
     args = parse_args()
     _verbose = args.verbose
@@ -201,8 +337,10 @@ def main():
 
     while not _shutdown:
         fds = [dev.fd for _, dev in dev_list]
+        # Block with no timeout when idle (zero CPU), tick at ~60fps when scrolling
+        timeout = SCROLL_TICK if mode == SCROLL_MODE else None
         try:
-            r, _, _ = select(fds, [], [], SCROLL_TICK)
+            r, _, _ = select(fds, [], [], timeout)
         except (OSError, ValueError):
             continue
 
@@ -295,46 +433,27 @@ def main():
                 last_tick = time.monotonic()
                 continue
 
-            # Offset from fixed anchor
-            dx = cx - anchor[0]
-            dy = cy - anchor[1]
-
-            # Deadzone: no scroll inside, clear all accumulators
-            dist = math.hypot(dx, dy)
-            if dist <= args.deadzone:
-                scroll_hi_x = 0.0
-                scroll_hi_y = 0.0
-                std_notch_x = 0.0
-                std_notch_y = 0.0
-                last_tick = time.monotonic()
-                continue
-
-            # Frame-rate-independent physics.
-            # sensitivity = notches/s per pixel from anchor.
-            # Multiply by effective distance and delta-time for true rate.
+            # Offset from fixed anchor → raw deltas (pure physics)
             now = time.monotonic()
             dt = max(now - last_tick, 0.0)
             last_tick = now
 
-            effective_dist = dist - args.deadzone
-            rate = effective_dist * args.sensitivity  # notches/s
+            deltas = compute_scroll_deltas(anchor, (cx, cy), args.deadzone,
+                                           args.sensitivity, args.invert, dt)
+            if deltas is None:
+                # Deadzone: no scroll, clear accumulators
+                scroll_hi_x = 0.0
+                scroll_hi_y = 0.0
+                std_notch_x = 0.0
+                std_notch_y = 0.0
+                continue
 
-            # Direction (normalized) — vertical inverted for Windows-style:
-            # moving cursor down → scroll down (positive REL_WHEEL)
-            nx = dx / dist
-            ny = -dy / dist
+            delta_hi_x, delta_hi_y, delta_std_x, delta_std_y = deltas
 
-            if args.invert:
-                nx = -nx
-                ny = -ny
-
-            # Accumulate at hi-res resolution (120 units per notch)
-            delta_hi_x = nx * rate * dt * 120
-            delta_hi_y = ny * rate * dt * 120
+            # Accumulate hi-res (120 units per notch)
             scroll_hi_x += delta_hi_x
             scroll_hi_y += delta_hi_y
 
-            # Fire hi-res events
             emit_hi_x = int(scroll_hi_x)
             emit_hi_y = int(scroll_hi_y)
             if emit_hi_x or emit_hi_y:
@@ -342,12 +461,8 @@ def main():
                 scroll_hi_y -= emit_hi_y
                 emit_scroll(ui, emit_hi_x, emit_hi_y, args.no_horizontal)
 
-            # Fire standard (whole-notch) events when enabled.
-            # Derived from the same physical deltas, accumulated in separate
-            # floats that are cleared alongside hi-res on deadzone entry.
+            # Fire standard (whole-notch) events when enabled
             if args.scroll_events == 'both':
-                delta_std_x = nx * rate * dt  # notches
-                delta_std_y = ny * rate * dt
                 std_notch_x += delta_std_x
                 std_notch_y += delta_std_y
                 emit_std_x = int(std_notch_x)

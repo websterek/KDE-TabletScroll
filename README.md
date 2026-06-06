@@ -53,41 +53,48 @@ sudo usermod -a -G input $USER
 ```bash
 git clone https://github.com/websterek/KDE-TabletScroll.git
 cd KDE-TabletScroll
-chmod +x scroll-daemon
-./scroll-daemon
+chmod +x scroll-daemon.py
+./scroll-daemon.py
 ```
 
 ## Usage
 
 ```
-scroll-daemon [OPTIONS]
+scroll-daemon.py [OPTIONS]
 ```
 
 ### Options
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--sensitivity` | float | `0.00024` | Scroll speed (higher = faster) |
-| `--timeout` | int | `300` | Double‑click timeout in milliseconds |
+| `--sensitivity` | float | `0.03` | Scroll speed in notches/s per pixel from anchor (higher = faster) |
 | `--deadzone` | int | `16` | Dead zone radius in pixels (no scroll within) |
-| `--no-horizontal` | flag | — | Disable horizontal scrolling |
+| `--no-horizontal` | flag | — | Disable horizontal scrolling (alias: `--vertical-only`) |
 | `--invert` | flag | — | Invert scroll direction |
-| `--double-click` | flag | — | Require double-click-and-hold to scroll (default: single-click) |
+| `--verbose` | flag | — | Print status messages (device opened, scroll mode, etc.) |
+| `--device` | str | — | Match only devices whose name contains this substring (case-insensitive) |
+| `--scroll-events` | str | `both` | Scroll event type: `hi-res` only or `both` (hi-res + standard notches) |
 
 ### Examples
 
 ```bash
-# Default — single middle-click-and-hold scrolls
-./scroll-daemon
+# Default — single middle-click-and-hold scrolls (hi-res + standard events)
+./scroll-daemon.py
 
 # Slower scrolling
-./scroll-daemon --sensitivity 0.0001
+./scroll-daemon.py --sensitivity 0.01
 
-# Double-click to activate (closer to Windows behavior)
-./scroll-daemon --double-click
+# Only emit hi-res scroll events (some apps don't need standard notches)
+./scroll-daemon.py --scroll-events hi-res
 
-# No horizontal scroll, higher sensitivity
-./scroll-daemon --no-horizontal --sensitivity 0.0005
+# Filter to a specific device (e.g. your Wacom tablet)
+./scroll-daemon.py --device "wacom"
+
+# No horizontal scroll, inverted direction
+./scroll-daemon.py --no-horizontal --invert
+
+# Verbose mode for debugging
+./scroll-daemon.py --verbose
 ```
 
 ## Autostart (KDE Plasma)
@@ -98,7 +105,7 @@ scroll-daemon [OPTIONS]
 
 ```bash
 #!/bin/bash
-/path/to/KDE-TabletScroll/scroll-daemon --sensitivity 0.00024 &
+/path/to/KDE-TabletScroll/scroll-daemon.py --sensitivity 0.03 &
 ```
 
 ## How It Works
