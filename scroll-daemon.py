@@ -8,7 +8,7 @@ Middle-click scroll daemon for Linux (X11 + Wayland).
   Release middle button → back to normal.
 
 Usage:
-  scroll-daemon [--sensitivity FLOAT] [--timeout MS] [--deadzone PX]
+  scroll-daemon [--sensitivity FLOAT] [--deadzone PX]
                 [--no-horizontal] [--invert] [--device NAME]
 
 Requirements:
@@ -21,7 +21,6 @@ import math
 import signal
 import sys
 import time
-from collections import namedtuple
 from select import select
 
 from evdev import InputDevice, UInput, ecodes, list_devices
@@ -40,16 +39,12 @@ def parse_args():
     p = argparse.ArgumentParser(description='Middle-click scroll daemon')
     p.add_argument('--sensitivity', type=float, default=0.00024,
                    help='Scroll speed (default: 0.00024, higher = faster)')
-    p.add_argument('--timeout', type=int, default=300,
-                   help='Double-click timeout in ms (default: 300)')
     p.add_argument('--deadzone', type=int, default=16,
                    help='Radius in pixels where no scroll occurs (default: 16)')
     p.add_argument('--no-horizontal', '--vertical-only', action='store_true',
                    help='Disable horizontal scroll')
     p.add_argument('--invert', action='store_true',
                    help='Invert scroll direction')
-    p.add_argument('--double-click', action='store_true',
-                   help='Require double-click-and-hold to scroll (default: single click)')
     p.add_argument('--verbose', action='store_true',
                    help='Print status messages (device opened, scroll mode, etc.)')
     p.add_argument('--device', type=str, default=None,
@@ -124,12 +119,7 @@ def handle_signal(sig, frame):
 # ── state machine constants ────────────────────────────────────────
 
 IDLE = 0
-FIRST_CLICK = 1
-SCROLL_MODE = 2
-
-ScrollState = namedtuple('ScrollState', ['mode', 'first_time', 'trigger_dev'])
-"""State machine record: mode (IDLE/FIRST_CLICK/SCROLL_MODE), first click
-timestamp, and the fd of the device that triggered scroll mode."""
+SCROLL_MODE = 1
 
 # Scroll tick interval: ~60 fps for smooth continuous scrolling
 SCROLL_TICK = 0.016
@@ -142,17 +132,6 @@ def _get_device_position(fd, last_pos, rel_accum):
         return pos
     acc = rel_accum.get(fd, [0, 0])
     return (acc[0], acc[1])
-
-
-def _set_scroll_anchor(fd, name, last_pos, rel_accum):
-    """Record the anchor position for scroll mode and reset relative tracking.
-
-    Returns the new anchor as (x, y) tuple so the caller can store it.
-    """
-    anchor = _get_device_position(fd, last_pos, rel_accum)
-    rel_accum.pop(fd, None)
-    _dbg(f"Scroll mode ON ({name})")
-    return anchor
 
 
 def emit_scroll(ui, dx_hi_res, dy_hi_res, no_horizontal):
@@ -177,7 +156,6 @@ def emit_scroll(ui, dx_hi_res, dy_hi_res, no_horizontal):
 
 def main():
     args = parse_args()
-    timeout_s = args.timeout / 1000.0
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
@@ -195,17 +173,19 @@ def main():
     fd_to_dev = {dev.fd: (name, dev) for name, dev in dev_list}
 
     # ── state ──
-    state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
-
-    # Anchor model: position when scroll mode started
+    mode = IDLE                # IDLE or SCROLL_MODE
+    trigger_dev = None         # fd of the device that triggered scroll mode
     anchor = (0, 0)           # (x, y) anchor point
+    anchor_settle_deadline = 0.0  # monotonic deadline; until this time the anchor
+                                  # floats with the cursor to absorb
+                                  # click-pressure wobble. No scroll fires.
+    anchor_settle_samples = []  # cursor positions collected during settle window
     last_pos = {}              # {fd: (x, y)} last known position (absolute devices)
     rel_accum = {}             # {fd: [x, y]} accumulated relative motion (mice)
     scroll_hi_x = 0.0          # fractional hi-res scroll accumulators (120 → 1 notch)
     scroll_hi_y = 0.0          # finer quantization for smooth low-speed scrolling
 
-    mode_label = "Double" if args.double_click else "Single"
-    _dbg(f"Listening. {mode_label} middle-click + hold to scroll. Ctrl+C to stop.")
+    _dbg("Listening. Middle-click + hold to scroll. Ctrl+C to stop.")
 
     while not _shutdown:
         fds = [dev.fd for _, dev in dev_list]
@@ -231,7 +211,7 @@ def main():
                 ecode = event.code
                 evalue = event.value
 
-                # === Track position (all states) ===
+                # Track all position changes
                 if etype == ecodes.EV_ABS:
                     cur = last_pos.get(fd, (0, 0))
                     if ecode == ecodes.ABS_X:
@@ -245,60 +225,61 @@ def main():
                     elif ecode == ecodes.REL_Y:
                         acc[1] += evalue
 
-                # === MIDDLE CLICK HANDLING ===
+                # Middle-click handling
                 if etype == ecodes.EV_KEY and ecode == ecodes.BTN_MIDDLE:
                     if evalue == 1:  # PRESS
-                        now = time.monotonic()
-
-                        if state.mode == IDLE:
-                            if not args.double_click:
-                                # Default single-click: press → scroll immediately
-                                state = ScrollState(mode=SCROLL_MODE,
-                                                    first_time=now,
-                                                    trigger_dev=fd)
-                                anchor = _set_scroll_anchor(fd, name, last_pos, rel_accum)
-                            else:
-                                state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
-
-                        elif state.mode == FIRST_CLICK:
-                            if now - state.first_time <= timeout_s:
-                                # Double-click → enter scroll mode on HOLD
-                                state = ScrollState(mode=SCROLL_MODE,
-                                                    first_time=state.first_time,
-                                                    trigger_dev=fd)
-                                # Inject synthetic release so apps see clean double-click
-                                ui.write(ecodes.EV_KEY, ecodes.BTN_MIDDLE, 0)
-                                ui.syn()
-                                # Set anchor and reset relative tracking
-                                anchor = _set_scroll_anchor(fd, name, last_pos, rel_accum)
-                            else:
-                                state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
-
-                        elif state.mode == SCROLL_MODE:
-                            state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
+                        if mode == IDLE:
+                            mode = SCROLL_MODE
+                            trigger_dev = fd
+                            # Seed anchor from last known position so the
+                            # settling window has a sane starting point.
+                            anchor = _get_device_position(fd, last_pos, rel_accum)
+                            anchor_settle_deadline = time.monotonic() + 0.1
+                            anchor_settle_samples.clear()
+                            _dbg(f"Scroll mode ON ({name})")
+                        elif mode == SCROLL_MODE:
+                            mode = IDLE
+                            trigger_dev = None
+                            anchor_settle_deadline = 0.0
+                            anchor_settle_samples.clear()
                             _dbg("Scroll mode OFF")
 
                     elif evalue == 0:  # RELEASE
-                        if state.mode == SCROLL_MODE:
-                            state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
+                        if mode == SCROLL_MODE:
+                            mode = IDLE
+                            trigger_dev = None
+                            anchor_settle_deadline = 0.0
+                            anchor_settle_samples.clear()
                             _dbg("Scroll mode OFF (released)")
 
-                # === FIRST_CLICK timeout ===
-                if state.mode == FIRST_CLICK:
-                    if time.monotonic() - state.first_time > timeout_s:
-                        state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
-
         # ── scroll tick: emit scroll based on offset from anchor ──
-        if state.mode == SCROLL_MODE and not _shutdown:
-            fd = state.trigger_dev
+        if mode == SCROLL_MODE and not _shutdown:
+            fd = trigger_dev
 
             cx, cy = _get_device_position(fd, last_pos, rel_accum)
 
-            # Offset from anchor
+            # Settling window: for ~100ms after entering SCROLL_MODE,
+            # collect cursor positions to compute the true resting center.
+            # No scroll can fire during this window; it's too short
+            # to be perceptible.
+            if anchor_settle_deadline > 0:
+                if time.monotonic() < anchor_settle_deadline:
+                    anchor_settle_samples.append((cx, cy))
+                    continue
+                # Window expired — lock anchor at average resting position
+                if anchor_settle_samples:
+                    sx = sum(s[0] for s in anchor_settle_samples) / len(anchor_settle_samples)
+                    sy = sum(s[1] for s in anchor_settle_samples) / len(anchor_settle_samples)
+                    anchor = (sx, sy)
+                anchor_settle_samples.clear()
+                anchor_settle_deadline = 0
+                continue
+
+            # Offset from fixed anchor
             dx = cx - anchor[0]
             dy = cy - anchor[1]
 
-            # Circular deadzone — stop and reset accumulators
+            # Deadzone: no scroll inside, just clear accumulators
             dist = math.hypot(dx, dy)
             if dist <= args.deadzone:
                 if scroll_hi_x != 0.0 or scroll_hi_y != 0.0:
