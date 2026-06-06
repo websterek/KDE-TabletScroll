@@ -30,8 +30,8 @@ from evdev import InputDevice, UInput, ecodes, list_devices
 
 def parse_args():
     p = argparse.ArgumentParser(description='Middle-click scroll daemon')
-    p.add_argument('--sensitivity', type=float, default=0.0005,
-                   help='Scroll speed (default: 0.0005, higher = faster)')
+    p.add_argument('--sensitivity', type=float, default=0.00012,
+                   help='Scroll speed (default: 0.00012, higher = faster)')
     p.add_argument('--timeout', type=int, default=300,
                    help='Double-click timeout in ms (default: 300)')
     p.add_argument('--deadzone', type=int, default=8,
@@ -108,17 +108,16 @@ ScrollState = namedtuple('ScrollState', ['mode', 'first_time', 'trigger_dev'])
 SCROLL_TICK = 0.016
 
 
-def emit_scroll(ui, dx, dy, no_horizontal):
-    """Emit scroll events via uinput (both low-res and hi-res for libinput)."""
-    if dy:
-        # libinput needs both REL_WHEEL (~1 unit per notch) and
-        # REL_WHEEL_HI_RES (120 units per notch) to work correctly
-        ui.write(ecodes.EV_REL, ecodes.REL_WHEEL, dy)
-        ui.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, dy * 120)
-    if dx and not no_horizontal:
-        ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL, dx)
-        ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL_HI_RES, dx * 120)
-    if dx or dy:
+def emit_scroll(ui, dx_hi_res, dy_hi_res, no_horizontal):
+    """Emit scroll via hi-res relative axis (120 units per notch)."""
+    fired = False
+    if dy_hi_res:
+        ui.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, dy_hi_res)
+        fired = True
+    if dx_hi_res and not no_horizontal:
+        ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL_HI_RES, dx_hi_res)
+        fired = True
+    if fired:
         ui.syn()
 
 
@@ -150,8 +149,8 @@ def main():
     anchor = (0, 0)           # (x, y) anchor point
     last_pos = {}              # {fd: (x, y)} last known position (absolute devices)
     rel_accum = {}             # {fd: [x, y]} accumulated relative motion (mice)
-    scroll_frac_x = 0.0        # fractional scroll for smooth accumulation
-    scroll_frac_y = 0.0        # prevents deadzone boundary flicker
+    scroll_hi_x = 0.0          # fractional hi-res scroll accumulators (120 → 1 notch)
+    scroll_hi_y = 0.0          # finer quantization for smooth low-speed scrolling
 
     print("[INFO] Listening. Double middle-click + hold to scroll. Ctrl+C to stop.")
 
@@ -256,9 +255,9 @@ def main():
             # Circular deadzone — stop and reset accumulators
             dist = math.hypot(dx, dy)
             if dist <= args.deadzone:
-                if scroll_frac_x != 0.0 or scroll_frac_y != 0.0:
-                    scroll_frac_x = 0.0
-                    scroll_frac_y = 0.0
+                if scroll_hi_x != 0.0 or scroll_hi_y != 0.0:
+                    scroll_hi_x = 0.0
+                    scroll_hi_y = 0.0
                 continue
 
             # Speed proportional to distance beyond deadzone
@@ -270,21 +269,19 @@ def main():
             nx = dx / dist
             ny = -dy / dist
 
-            # Scroll values (fractional accumulation to prevent flicker)
-            scroll_frac_x += nx * speed
-            scroll_frac_y += ny * speed
+            if args.invert:
+                nx = -nx
+                ny = -ny
 
-            scr_x = int(scroll_frac_x)
-            scr_y = int(scroll_frac_y)
+            # Accumulate at hi-res resolution (120 units per notch)
+            scroll_hi_x += nx * speed * 120
+            scroll_hi_y += ny * speed * 120
 
+            scr_x = int(scroll_hi_x)
+            scr_y = int(scroll_hi_y)
             if scr_x or scr_y:
-                scroll_frac_x -= scr_x
-                scroll_frac_y -= scr_y
-
-                if args.invert:
-                    scr_x = -scr_x
-                    scr_y = -scr_y
-
+                scroll_hi_x -= scr_x
+                scroll_hi_y -= scr_y
                 emit_scroll(ui, scr_x, scr_y, args.no_horizontal)
 
     # ── cleanup ──
