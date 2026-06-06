@@ -94,6 +94,7 @@ def create_uinput():
 _shutdown = False
 
 def handle_signal(sig, frame):
+    """Signal handler for SIGINT/SIGTERM — sets flag to exit event loop gracefully."""
     global _shutdown
     _shutdown = True
 
@@ -105,13 +106,42 @@ FIRST_CLICK = 1
 SCROLL_MODE = 2
 
 ScrollState = namedtuple('ScrollState', ['mode', 'first_time', 'trigger_dev'])
+"""State machine record: mode (IDLE/FIRST_CLICK/SCROLL_MODE), first click
+timestamp, and the fd of the device that triggered scroll mode."""
 
 # Scroll tick interval: ~60 fps for smooth continuous scrolling
 SCROLL_TICK = 0.016
 
 
+def _get_device_position(fd, last_pos, rel_accum):
+    """Return (x, y) for a device from absolute tracking or relative accumulation."""
+    pos = last_pos.get(fd)
+    if pos is not None:
+        return pos
+    acc = rel_accum.get(fd, [0, 0])
+    return (acc[0], acc[1])
+
+
+def _set_scroll_anchor(fd, name, last_pos, rel_accum):
+    """Record the anchor position for scroll mode and reset relative tracking.
+
+    Returns the new anchor as (x, y) tuple so the caller can store it.
+    """
+    anchor = _get_device_position(fd, last_pos, rel_accum)
+    rel_accum.pop(fd, None)
+    print(f"[INFO] Scroll mode ON ({name})")
+    return anchor
+
+
 def emit_scroll(ui, dx_hi_res, dy_hi_res, no_horizontal):
-    """Emit scroll via hi-res relative axis (120 units per notch)."""
+    """Inject hi-res scroll events (120 units per notch) and a sync packet.
+
+    Args:
+        ui: uinput device for injection.
+        dx_hi_res: horizontal hi-res delta (signed int).
+        dy_hi_res: vertical hi-res delta (signed int).
+        no_horizontal: if True, suppress horizontal scroll.
+    """
     fired = False
     if dy_hi_res:
         ui.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, dy_hi_res)
@@ -206,14 +236,7 @@ def main():
                                 state = ScrollState(mode=SCROLL_MODE,
                                                     first_time=now,
                                                     trigger_dev=fd)
-                                pos = last_pos.get(fd)
-                                if pos is not None:
-                                    anchor = pos
-                                else:
-                                    acc = rel_accum.get(fd, [0, 0])
-                                    anchor = (acc[0], acc[1])
-                                rel_accum.pop(fd, None)
-                                print(f"[INFO] Scroll mode ON ({name})")
+                                anchor = _set_scroll_anchor(fd, name, last_pos, rel_accum)
                             else:
                                 state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
 
@@ -226,16 +249,8 @@ def main():
                                 # Inject synthetic release so apps see clean double-click
                                 ui.write(ecodes.EV_KEY, ecodes.BTN_MIDDLE, 0)
                                 ui.syn()
-                                # Set anchor at current position
-                                pos = last_pos.get(fd)
-                                if pos is not None:
-                                    anchor = pos
-                                else:
-                                    acc = rel_accum.get(fd, [0, 0])
-                                    anchor = (acc[0], acc[1])
-                                # Reset relative accum for clean tracking from anchor
-                                rel_accum.pop(fd, None)
-                                print(f"[INFO] Scroll mode ON ({name})")
+                                # Set anchor and reset relative tracking
+                                anchor = _set_scroll_anchor(fd, name, last_pos, rel_accum)
                             else:
                                 state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
 
@@ -257,13 +272,7 @@ def main():
         if state.mode == SCROLL_MODE and not _shutdown:
             fd = state.trigger_dev
 
-            # Get current position
-            pos = last_pos.get(fd)
-            if pos is not None:
-                cx, cy = pos
-            else:
-                acc = rel_accum.get(fd, [0, 0])
-                cx, cy = acc[0], acc[1]
+            cx, cy = _get_device_position(fd, last_pos, rel_accum)
 
             # Offset from anchor
             dx = cx - anchor[0]
