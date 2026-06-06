@@ -28,7 +28,15 @@ from evdev import InputDevice, UInput, ecodes, list_devices
 
 # ── CLI ────────────────────────────────────────────────────────────
 
+_verbose = False  # set by parse_args() when --verbose is passed
+
+def _dbg(msg):
+    """Print a debug message only when --verbose is set."""
+    if _verbose:
+        print(f"[INFO] {msg}")
+
 def parse_args():
+    global _verbose
     p = argparse.ArgumentParser(description='Middle-click scroll daemon')
     p.add_argument('--sensitivity', type=float, default=0.00024,
                    help='Scroll speed (default: 0.00024, higher = faster)')
@@ -42,7 +50,12 @@ def parse_args():
                    help='Invert scroll direction')
     p.add_argument('--double-click', action='store_true',
                    help='Require double-click-and-hold to scroll (default: single click)')
-    return p.parse_args()
+    p.add_argument('--verbose', action='store_true',
+                   help='Print status messages (device opened, scroll mode, etc.)')
+    args = p.parse_args()
+    global _verbose
+    _verbose = args.verbose
+    return args
 
 
 # ── device discovery ───────────────────────────────────────────────
@@ -63,13 +76,12 @@ def find_middleclick_devices():
                 continue
             if ecodes.BTN_MIDDLE in keys:
                 results.append((dev.name, dev))
-                print(f"[INFO] Opened {path} ({dev.name})")
             else:
                 dev.close()
         except PermissionError:
-            print(f"[WARN] Permission denied: {path}", file=sys.stderr)
-        except Exception as e:
-            print(f"[WARN] {path}: {e}", file=sys.stderr)
+            pass
+        except Exception:
+            pass
     return results
 
 
@@ -85,7 +97,7 @@ def create_uinput():
         ecodes.EV_KEY: [ecodes.BTN_MIDDLE],
     }
     ui = UInput(caps, name=OUR_NAME)
-    print("[INFO] uinput device created")
+    _dbg("uinput device created")
     return ui
 
 
@@ -129,7 +141,7 @@ def _set_scroll_anchor(fd, name, last_pos, rel_accum):
     """
     anchor = _get_device_position(fd, last_pos, rel_accum)
     rel_accum.pop(fd, None)
-    print(f"[INFO] Scroll mode ON ({name})")
+    _dbg(f"Scroll mode ON ({name})")
     return anchor
 
 
@@ -185,7 +197,7 @@ def main():
     scroll_hi_y = 0.0          # finer quantization for smooth low-speed scrolling
 
     mode_label = "Double" if args.double_click else "Single"
-    print(f"[INFO] Listening. {mode_label} middle-click + hold to scroll. Ctrl+C to stop.")
+    _dbg(f"Listening. {mode_label} middle-click + hold to scroll. Ctrl+C to stop.")
 
     while not _shutdown:
         fds = [dev.fd for _, dev in dev_list]
@@ -256,12 +268,12 @@ def main():
 
                         elif state.mode == SCROLL_MODE:
                             state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
-                            print("[INFO] Scroll mode OFF")
+                            _dbg("Scroll mode OFF")
 
                     elif evalue == 0:  # RELEASE
                         if state.mode == SCROLL_MODE:
                             state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
-                            print("[INFO] Scroll mode OFF (released)")
+                            _dbg("Scroll mode OFF (released)")
 
                 # === FIRST_CLICK timeout ===
                 if state.mode == FIRST_CLICK:
@@ -311,14 +323,14 @@ def main():
                 emit_scroll(ui, scr_x, scr_y, args.no_horizontal)
 
     # ── cleanup ──
-    print("\n[INFO] Shutting down...")
+    _dbg("Shutting down...")
     ui.close()
     for _, dev in dev_list:
         try:
             dev.close()
         except Exception:
             pass
-    print("[INFO] Goodbye.")
+    _dbg("Goodbye.")
 
 
 if __name__ == '__main__':
