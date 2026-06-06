@@ -157,14 +157,7 @@ def emit_scroll(ui, dx_hi_res, dy_hi_res, no_horizontal):
         ui.syn()
 
 
-def _enter_scroll_mode(fd, last_pos, rel_accum):
-    """Set up scroll mode state: track given fd, seed anchor, arm settle window."""
-    anchor = _get_device_position(fd, last_pos, rel_accum)
-    return (SCROLL_MODE, fd, anchor, time.monotonic() + SETTLE_DURATION, [])
 
-def _exit_scroll_mode():
-    """Return idle state for scroll-mode fields (anchor is left unchanged)."""
-    return (IDLE, None, 0.0, [])
 
 # ── main ────────────────────────────────────────────────────────────
 
@@ -192,9 +185,9 @@ def main():
     mode = IDLE                # IDLE or SCROLL_MODE
     trigger_dev = None         # fd of the device that triggered scroll mode
     anchor = (0, 0)           # (x, y) anchor point
-    anchor_settle_deadline = 0.0  # monotonic deadline; until this time the anchor
-                                  # floats with the cursor to absorb
-                                  # click-pressure wobble. No scroll fires.
+    # monotonic deadline: until this time, the anchor floats with the cursor
+    # to absorb click-pressure wobble. No scroll fires during this window.
+    anchor_settle_deadline = 0.0
     anchor_settle_samples = []  # cursor positions collected during settle window
     last_pos = {}              # {fd: (x, y)} last known position (absolute devices)
     rel_accum = {}             # {fd: [x, y]} accumulated relative motion (mice)
@@ -248,20 +241,28 @@ def main():
                 if etype == ecodes.EV_KEY and ecode == ecodes.BTN_MIDDLE:
                     if evalue == 1:  # PRESS
                         if mode == IDLE:
-                            mode, trigger_dev, anchor, anchor_settle_deadline, anchor_settle_samples = \
-                                _enter_scroll_mode(fd, last_pos, rel_accum)
+                            mode = SCROLL_MODE
+                            trigger_dev = fd
+                            anchor = _get_device_position(fd, last_pos, rel_accum)
+                            anchor_settle_deadline = time.monotonic() + SETTLE_DURATION
+                            anchor_settle_samples = []
                             # Reset dt clock so first frame isn't inflated by idle time
                             last_tick = time.monotonic()
                             _dbg(f"Scroll mode ON ({name})")
                         elif mode == SCROLL_MODE:
-                            mode, trigger_dev, anchor_settle_deadline, anchor_settle_samples = \
-                                _exit_scroll_mode()
+                            mode = IDLE
+                            trigger_dev = None
+                            # anchor intentionally preserved — frozen at last position
+                            anchor_settle_deadline = 0.0
+                            anchor_settle_samples = []
                             _dbg("Scroll mode OFF")
 
                     elif evalue == 0:  # RELEASE
                         if mode == SCROLL_MODE:
-                            mode, trigger_dev, anchor_settle_deadline, anchor_settle_samples = \
-                                _exit_scroll_mode()
+                            mode = IDLE
+                            trigger_dev = None
+                            anchor_settle_deadline = 0.0
+                            anchor_settle_samples = []
                             _dbg("Scroll mode OFF (released)")
 
         # ── scroll tick: emit scroll based on offset from anchor ──
@@ -334,12 +335,12 @@ def main():
             scroll_hi_y += delta_hi_y
 
             # Fire hi-res events
-            scr_x = int(scroll_hi_x)
-            scr_y = int(scroll_hi_y)
-            if scr_x or scr_y:
-                scroll_hi_x -= scr_x
-                scroll_hi_y -= scr_y
-                emit_scroll(ui, scr_x, scr_y, args.no_horizontal)
+            emit_hi_x = int(scroll_hi_x)
+            emit_hi_y = int(scroll_hi_y)
+            if emit_hi_x or emit_hi_y:
+                scroll_hi_x -= emit_hi_x
+                scroll_hi_y -= emit_hi_y
+                emit_scroll(ui, emit_hi_x, emit_hi_y, args.no_horizontal)
 
             # Fire standard (whole-notch) events when enabled.
             # Derived from the same physical deltas, accumulated in separate
@@ -349,15 +350,15 @@ def main():
                 delta_std_y = ny * rate * dt
                 std_notch_x += delta_std_x
                 std_notch_y += delta_std_y
-                std_x = int(std_notch_x)
-                std_y = int(std_notch_y)
-                if std_x or std_y:
-                    std_notch_x -= std_x
-                    std_notch_y -= std_y
-                    if std_y:
-                        ui.write(ecodes.EV_REL, ecodes.REL_WHEEL, std_y)
-                    if std_x and not args.no_horizontal:
-                        ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL, std_x)
+                emit_std_x = int(std_notch_x)
+                emit_std_y = int(std_notch_y)
+                if emit_std_x or emit_std_y:
+                    std_notch_x -= emit_std_x
+                    std_notch_y -= emit_std_y
+                    if emit_std_y:
+                        ui.write(ecodes.EV_REL, ecodes.REL_WHEEL, emit_std_y)
+                    if emit_std_x and not args.no_horizontal:
+                        ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL, emit_std_x)
                     ui.syn()
 
     # ── cleanup ──
