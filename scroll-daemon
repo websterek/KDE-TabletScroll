@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+Middle-click scroll daemon for Linux (X11 + Wayland).
+
+Double middle-click-and-hold → Windows-style autoscroll:
+  Pen/mouse distance from click point determines scroll speed and direction.
+  Farther from anchor = faster. Direction = scroll direction.
+  Release middle button → back to normal.
+
+Usage:
+  scroll-daemon [--sensitivity FLOAT] [--timeout MS] [--deadzone PX]
+                [--no-horizontal] [--invert]
+
+Requirements:
+  python-evdev (pacman -S python-evdev or pip install evdev)
+  User in 'input' group (sudo usermod -a -G input $USER → relogin after)
+"""
+
+import argparse
+import math
+import signal
+import sys
+import time
+from collections import namedtuple
+from select import select
+
+from evdev import InputDevice, UInput, ecodes, list_devices
+
+# ── CLI ────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description='Middle-click scroll daemon')
+    p.add_argument('--sensitivity', type=float, default=0.0005,
+                   help='Scroll speed (default: 0.0005, higher = faster)')
+    p.add_argument('--timeout', type=int, default=300,
+                   help='Double-click timeout in ms (default: 300)')
+    p.add_argument('--deadzone', type=int, default=8,
+                   help='Radius in pixels where no scroll occurs (default: 8)')
+    p.add_argument('--no-horizontal', action='store_true',
+                   help='Disable horizontal scroll')
+    p.add_argument('--invert', action='store_true',
+                   help='Invert scroll direction')
+    return p.parse_args()
+
+
+# ── device discovery ───────────────────────────────────────────────
+
+OUR_NAME = 'middle-click-scroll'
+
+def find_middleclick_devices():
+    """Return list of (name, InputDevice) for devices with BTN_MIDDLE,
+    excluding our own uinput device."""
+    results = []
+    for path in sorted(list_devices()):
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities(verbose=False)
+            keys = caps.get(ecodes.EV_KEY, [])
+            if dev.name == OUR_NAME:
+                dev.close()
+                continue
+            if ecodes.BTN_MIDDLE in keys:
+                results.append((dev.name, dev))
+                print(f"[INFO] Opened {path} ({dev.name})")
+            else:
+                dev.close()
+        except PermissionError:
+            print(f"[WARN] Permission denied: {path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] {path}: {e}", file=sys.stderr)
+    return results
+
+
+# ── uinput ─────────────────────────────────────────────────────────
+
+def create_uinput():
+    """Create a virtual uinput device for scroll wheel injection."""
+    caps = {
+        ecodes.EV_REL: [
+            ecodes.REL_WHEEL, ecodes.REL_HWHEEL,
+            ecodes.REL_WHEEL_HI_RES, ecodes.REL_HWHEEL_HI_RES,
+        ],
+        ecodes.EV_KEY: [ecodes.BTN_MIDDLE],
+    }
+    ui = UInput(caps, name=OUR_NAME)
+    print("[INFO] uinput device created")
+    return ui
+
+
+# ── signal handling ────────────────────────────────────────────────
+
+_shutdown = False
+
+def handle_signal(sig, frame):
+    global _shutdown
+    _shutdown = True
+
+
+# ── state machine constants ────────────────────────────────────────
+
+IDLE = 0
+FIRST_CLICK = 1
+SCROLL_MODE = 2
+
+ScrollState = namedtuple('ScrollState', ['mode', 'first_time', 'trigger_dev'])
+
+# Scroll tick interval: ~60 fps for smooth continuous scrolling
+SCROLL_TICK = 0.016
+
+
+def emit_scroll(ui, dx, dy, no_horizontal):
+    """Emit scroll events via uinput (both low-res and hi-res for libinput)."""
+    if dy:
+        # libinput needs both REL_WHEEL (~1 unit per notch) and
+        # REL_WHEEL_HI_RES (120 units per notch) to work correctly
+        ui.write(ecodes.EV_REL, ecodes.REL_WHEEL, dy)
+        ui.write(ecodes.EV_REL, ecodes.REL_WHEEL_HI_RES, dy * 120)
+    if dx and not no_horizontal:
+        ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL, dx)
+        ui.write(ecodes.EV_REL, ecodes.REL_HWHEEL_HI_RES, dx * 120)
+    if dx or dy:
+        ui.syn()
+
+
+def main():
+    args = parse_args()
+    timeout_s = args.timeout / 1000.0
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    ui = create_uinput()
+
+    dev_list = find_middleclick_devices()
+    if not dev_list:
+        ui.close()
+        print("[ERROR] No devices with BTN_MIDDLE found.", file=sys.stderr)
+        print("[ERROR] Is the user in the 'input' group? (sudo usermod -a -G input $USER)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    fd_to_dev = {}
+    for name, dev in dev_list:
+        fd_to_dev[dev.fd] = (name, dev)
+
+    # ── state ──
+    state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
+
+    # Anchor model: position when scroll mode started
+    anchor = (0, 0)           # (x, y) anchor point
+    last_pos = {}              # {fd: (x, y)} last known position (absolute devices)
+    rel_accum = {}             # {fd: [x, y]} accumulated relative motion (mice)
+    scroll_frac_x = 0.0        # fractional scroll for smooth accumulation
+    scroll_frac_y = 0.0        # prevents deadzone boundary flicker
+
+    print("[INFO] Listening. Double middle-click + hold to scroll. Ctrl+C to stop.")
+
+    while not _shutdown:
+        fds = [dev.fd for _, dev in dev_list]
+        try:
+            r, _, _ = select(fds, [], [], SCROLL_TICK)
+        except (OSError, ValueError):
+            continue
+
+        # ── process events ──
+        for fd in r:
+            info = fd_to_dev.get(fd)
+            if info is None:
+                continue
+            name, dev = info
+
+            try:
+                events = list(dev.read())
+            except Exception:
+                continue
+
+            for event in events:
+                etype = event.type
+                ecode = event.code
+                evalue = event.value
+
+                # === Track position (all states) ===
+                if etype == ecodes.EV_ABS:
+                    cur = last_pos.get(fd, (0, 0))
+                    if ecode == ecodes.ABS_X:
+                        last_pos[fd] = (evalue, cur[1])
+                    elif ecode == ecodes.ABS_Y:
+                        last_pos[fd] = (cur[0], evalue)
+                elif etype == ecodes.EV_REL:
+                    acc = rel_accum.setdefault(fd, [0, 0])
+                    if ecode == ecodes.REL_X:
+                        acc[0] += evalue
+                    elif ecode == ecodes.REL_Y:
+                        acc[1] += evalue
+
+                # === MIDDLE CLICK HANDLING ===
+                if etype == ecodes.EV_KEY and ecode == ecodes.BTN_MIDDLE:
+                    if evalue == 1:  # PRESS
+                        now = time.monotonic()
+
+                        if state.mode == IDLE:
+                            state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
+
+                        elif state.mode == FIRST_CLICK:
+                            if now - state.first_time <= timeout_s:
+                                # Double-click → enter scroll mode on HOLD
+                                state = ScrollState(mode=SCROLL_MODE,
+                                                    first_time=state.first_time,
+                                                    trigger_dev=fd)
+                                # Inject synthetic release so apps see clean double-click
+                                ui.write(ecodes.EV_KEY, ecodes.BTN_MIDDLE, 0)
+                                ui.syn()
+                                # Set anchor at current position
+                                pos = last_pos.get(fd)
+                                if pos is not None:
+                                    anchor = pos
+                                else:
+                                    acc = rel_accum.get(fd, [0, 0])
+                                    anchor = (acc[0], acc[1])
+                                # Reset relative accum for clean tracking from anchor
+                                rel_accum.pop(fd, None)
+                                print(f"[INFO] Scroll mode ON ({name})")
+                            else:
+                                state = ScrollState(mode=FIRST_CLICK, first_time=now, trigger_dev=None)
+
+                        elif state.mode == SCROLL_MODE:
+                            state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
+                            print("[INFO] Scroll mode OFF")
+
+                    elif evalue == 0:  # RELEASE
+                        if state.mode == SCROLL_MODE:
+                            state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
+                            print("[INFO] Scroll mode OFF (released)")
+
+                # === FIRST_CLICK timeout ===
+                if state.mode == FIRST_CLICK:
+                    if time.monotonic() - state.first_time > timeout_s:
+                        state = ScrollState(mode=IDLE, first_time=0.0, trigger_dev=None)
+
+        # ── scroll tick: emit scroll based on offset from anchor ──
+        if state.mode == SCROLL_MODE and not _shutdown:
+            fd = state.trigger_dev
+
+            # Get current position
+            pos = last_pos.get(fd)
+            if pos is not None:
+                cx, cy = pos
+            else:
+                acc = rel_accum.get(fd, [0, 0])
+                cx, cy = acc[0], acc[1]
+
+            # Offset from anchor
+            dx = cx - anchor[0]
+            dy = cy - anchor[1]
+
+            # Circular deadzone — stop and reset accumulators
+            dist = math.hypot(dx, dy)
+            if dist <= args.deadzone:
+                if scroll_frac_x != 0.0 or scroll_frac_y != 0.0:
+                    scroll_frac_x = 0.0
+                    scroll_frac_y = 0.0
+                continue
+
+            # Speed proportional to distance beyond deadzone
+            effective_dist = dist - args.deadzone
+            speed = effective_dist * args.sensitivity
+
+            # Direction (normalized) — vertical inverted for Windows-style:
+            # moving cursor down → scroll down (positive REL_WHEEL)
+            nx = dx / dist
+            ny = -dy / dist
+
+            # Scroll values (fractional accumulation to prevent flicker)
+            scroll_frac_x += nx * speed
+            scroll_frac_y += ny * speed
+
+            scr_x = int(scroll_frac_x)
+            scr_y = int(scroll_frac_y)
+
+            if scr_x or scr_y:
+                scroll_frac_x -= scr_x
+                scroll_frac_y -= scr_y
+
+                if args.invert:
+                    scr_x = -scr_x
+                    scr_y = -scr_y
+
+                emit_scroll(ui, scr_x, scr_y, args.no_horizontal)
+
+    # ── cleanup ──
+    print("\n[INFO] Shutting down...")
+    ui.close()
+    for _, dev in dev_list:
+        try:
+            dev.close()
+        except Exception:
+            pass
+    print("[INFO] Goodbye.")
+
+
+if __name__ == '__main__':
+    main()
