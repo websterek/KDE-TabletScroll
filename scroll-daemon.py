@@ -9,7 +9,7 @@ Middle-click scroll daemon for Linux (X11 + Wayland).
 
 Usage:
   scroll-daemon [--sensitivity FLOAT] [--timeout MS] [--deadzone PX]
-                [--no-horizontal] [--invert]
+                [--no-horizontal] [--invert] [--device NAME]
 
 Requirements:
   python-evdev (pacman -S python-evdev or pip install evdev)
@@ -44,7 +44,7 @@ def parse_args():
                    help='Double-click timeout in ms (default: 300)')
     p.add_argument('--deadzone', type=int, default=16,
                    help='Radius in pixels where no scroll occurs (default: 16)')
-    p.add_argument('--no-horizontal', action='store_true',
+    p.add_argument('--no-horizontal', '--vertical-only', action='store_true',
                    help='Disable horizontal scroll')
     p.add_argument('--invert', action='store_true',
                    help='Invert scroll direction')
@@ -52,6 +52,8 @@ def parse_args():
                    help='Require double-click-and-hold to scroll (default: single click)')
     p.add_argument('--verbose', action='store_true',
                    help='Print status messages (device opened, scroll mode, etc.)')
+    p.add_argument('--device', type=str, default=None,
+                   help='Match only devices whose name contains this string (case-insensitive)')
     args = p.parse_args()
     global _verbose
     _verbose = args.verbose
@@ -62,9 +64,15 @@ def parse_args():
 
 OUR_NAME = 'middle-click-scroll'
 
-def find_middleclick_devices():
+def find_middleclick_devices(name_filter=None):
     """Return list of (name, InputDevice) for devices with BTN_MIDDLE,
-    excluding our own uinput device."""
+    excluding our own uinput device.
+
+    Args:
+        name_filter: If set, only include devices whose name contains this
+                     substring (case-insensitive). Useful for picking a
+                     specific device (e.g. 'G305' or 'wacom').
+    """
     results = []
     for path in sorted(list_devices()):
         try:
@@ -75,6 +83,9 @@ def find_middleclick_devices():
                 dev.close()
                 continue
             if ecodes.BTN_MIDDLE in keys:
+                if name_filter and name_filter.lower() not in dev.name.lower():
+                    dev.close()
+                    continue
                 results.append((dev.name, dev))
             else:
                 dev.close()
@@ -174,7 +185,7 @@ def main():
 
     ui = create_uinput()
 
-    dev_list = find_middleclick_devices()
+    dev_list = find_middleclick_devices(name_filter=args.device)
     if not dev_list:
         ui.close()
         print("[ERROR] No devices with BTN_MIDDLE found.", file=sys.stderr)
