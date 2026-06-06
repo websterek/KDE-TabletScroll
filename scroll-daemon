@@ -30,8 +30,8 @@ from evdev import InputDevice, UInput, ecodes, list_devices
 
 def parse_args():
     p = argparse.ArgumentParser(description='Middle-click scroll daemon')
-    p.add_argument('--sensitivity', type=float, default=0.00012,
-                   help='Scroll speed (default: 0.00012, higher = faster)')
+    p.add_argument('--sensitivity', type=float, default=0.00024,
+                   help='Scroll speed (default: 0.00024, higher = faster)')
     p.add_argument('--timeout', type=int, default=300,
                    help='Double-click timeout in ms (default: 300)')
     p.add_argument('--deadzone', type=int, default=8,
